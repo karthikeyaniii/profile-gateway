@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: profile-gateway
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LINKEDIN_LI_AT
+        sync: false
+      - key: LINKEDIN_JSESSIONID
+        sync: false
+      - key: LINKEDIN_USER_AGENT
+        sync: false
+      - key: LINKEDIN_SESSION_CAPTURED_AT
+        sync: false
+      - key: API_KEY
+        generateValue: true

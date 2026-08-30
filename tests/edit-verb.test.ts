@@ -1,0 +1,111 @@
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { dispatch } from '../src/cli.ts';
+
+const T0 = 1_800_000_000_000;
+const COMMENT = 'urn:li:comment:(activity:6620492574320930816,7493773969058062336)';
+const POST = 'urn:li:activity:6620492574320930816';
+
+let dir: string;
+let prev: string | undefined;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'profile-gateway-edit-'));
+  prev = process.env.PROFILE_GATEWAY_CACHE_DIR;
+  process.env.PROFILE_GATEWAY_CACHE_DIR = dir;
+});
+afterEach(() => {
+  if (prev === undefined) delete process.env.PROFILE_GATEWAY_CACHE_DIR;
+  else process.env.PROFILE_GATEWAY_CACHE_DIR = prev;
+  rmSync(dir, { recursive: true, force: true });
+});
+
+// `comment` used to EDIT when handed a comment urn. That silently does the
+// wrong thing for the most natural reading of the command — someone holding a
+// comment urn most likely wants to REPLY to it, not overwrite it. Editing gets
+// its own verb, and the overloaded form is refused rather than guessed at.
+describe('editing has its own verb', () => {
+  test('`comment` refuses a comment urn instead of silently editing', async () => {
+    const e = await dispatch(['comment', COMMENT, 'text'], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.code).toBe('INVALID_INPUT');
+  });
+
+  test('and points at the verb that does what was probably meant', async () => {
+    const e = await dispatch(['comment', COMMENT, 'text'], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.hint).toContain('profile-gateway edit');
+  });
+
+  test('`edit` rejects a POST urn — you cannot edit a post here', async () => {
+    const e = await dispatch(['edit', POST, 'text'], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.code).toBe('INVALID_INPUT');
+  });
+
+  test('`edit` requires the new text', async () => {
+    const e = await dispatch(['edit', COMMENT], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.code).toBe('INVALID_INPUT');
+  });
+
+  test('`edit` with a valid comment urn reaches the confirmation gate', async () => {
+    const e = await dispatch(['edit', COMMENT, 'new text'], T0);
+    if (e.ok) throw new Error('expected a gate refusal, not success');
+    // No TTY in tests: it must stop at the gate, before any network call.
+    expect(['CONFIRMATION_REQUIRED', 'AUTH_FAILED']).toContain(e.error.code);
+  });
+
+  test('`comment` still accepts a post urn', async () => {
+    const e = await dispatch(['comment', POST, 'text'], T0);
+    if (e.ok) throw new Error('expected a gate refusal');
+    expect(e.error.code).not.toBe('INVALID_INPUT');
+  });
+});
+
+// Replying and commenting are different operations that differ ONLY by which
+// binding the server hands back, so the urn cannot disambiguate them and each
+// gets its own verb.
+// `comment` on a comment urn names the verbs it could have meant. `reply` is
+// currently withdrawn (see below), but the disambiguation still matters.
+describe('comment on a comment urn disambiguates', () => {
+  test('names both verbs rather than picking one', async () => {
+    const e = await dispatch(['comment', COMMENT, 'text'], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.hint).toContain('profile-gateway edit');
+    expect(e.error.hint).toContain('profile-gateway reply');
+  });
+});
+
+// Reply was withdrawn once for posting a top-level comment. It is back on a
+// captured Voyager endpoint, so these assert routing rather than the refusal.
+describe('reply routing', () => {
+  test('rejects a post urn — you reply to comments, not posts', async () => {
+    const e = await dispatch(['reply', POST, 'text'], T0);
+    if (e.ok) throw new Error('expected refusal');
+    expect(e.error.code).toBe('INVALID_INPUT');
+    expect(e.error.hint).toContain('profile-gateway comment');
+  });
+
+  test('a comment urn reaches the gate, sending nothing', async () => {
+    const e = await dispatch(['reply', COMMENT, 'text'], T0);
+    if (e.ok) throw new Error('expected a gate refusal');
+    expect(['CONFIRMATION_REQUIRED', 'AUTH_FAILED']).toContain(e.error.code);
+  });
+
+  test('no TTY means no network call, not just no write', async () => {
+    let fetched = false;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      fetched = true;
+      return new Response('', { status: 200 });
+    }) as typeof fetch;
+    try {
+      await dispatch(['reply', COMMENT, 'text'], T0);
+      expect(fetched).toBe(false);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});

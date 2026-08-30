@@ -1,0 +1,270 @@
+// ─── Deleting a post ──────────────────────────────────────────────────────────
+//
+// The only irreversible action in the tool. Everything else it does can be
+// undone: an unwanted post can be deleted, a reaction removed, a cached row
+// purged. A deleted post is gone, and no confirmation prompt can give it back.
+//
+// So this one does something the others do not: it READS THE POST FIRST and
+// shows the human the actual text they are about to destroy. A urn is not
+// something anyone can eyeball — `urn:li:activity:7489428563075637248` and
+// `urn:li:activity:7489428563075637249` are the same string to a tired person
+// at a terminal, and one of them is the wrong post.
+//
+// The lookup is `my-posts`, which is the right source for three reasons at
+// once: it proves the post exists, it proves the OWNER wrote it (it came from
+// their own posts), and it carries the text. A post that is not in there is not
+// necessarily someone else's — it may just be older than the page we fetched —
+// so that case is reported rather than refused, and the prompt says plainly
+// that it is proceeding blind.
+
+import { CacheCorrupt, openDb, removeUrns } from '../cache/db.ts';
+import { buildHeaders } from '../engine/auth.ts';
+import { createEngine, createLiveClient } from '../engine/index.ts';
+import { extractCommentTokens } from '../engine/sdui-harvest.ts';
+import {
+  type CommentRef,
+  DELETE_OP,
+  parseCommentUrn,
+  runCommentAction,
+} from '../engine/sdui-menu.ts';
+import { LAUNCH_HINT, loadSession } from '../engine/session.ts';
+import { deletePost, isDeletableUrn } from '../engine/voyager-write.ts';
+import { type Shaped, shapeAll } from '../format.ts';
+import { err, ok } from '../output.ts';
+import type { Envelope } from '../types.ts';
+import type { ConfirmDeps, WritePlan } from './confirm.ts';
+import { gateWrite, recordHarvestSpend, reserve, terminalDeps } from './gate.ts';
+
+/** How many of the owner's recent posts to search for the one being deleted. */
+const LOOKUP_LIMIT = 50;
+
+const PREVIEW_CHARS = 200;
+
+/** The numeric id shared by every namespace a single post appears under. */
+function postId(urn: string): string | undefined {
+  return /:(\d+)$/.exec(urn)?.[1];
+}
+
+/**
+ * Find a post among the owner's own, matching across urn namespaces.
+ *
+ * The same post is `urn:li:activity:X` to the feed, `urn:li:ugcPost:X` to
+ * reactions and `urn:li:share:X` to the create endpoint. Matching on the shared
+ * numeric id means a urn from any read can be handed to delete.
+ */
+export function findOwnPost(posts: Shaped[], urn: string): Shaped | undefined {
+  const id = postId(urn);
+  if (id === undefined) return undefined;
+  return posts.find((p) => typeof p.urn === 'string' && postId(p.urn) === id);
+}
+
+/** What the human is shown about the post before they approve destroying it. */
+export function previewLines(post: Shaped | undefined): string[] {
+  if (post === undefined) {
+    return [
+      'content  COULD NOT READ THIS POST.',
+      '         It is not among your recent posts. That may only mean it is older',
+      '         than the page fetched — but nothing here has verified what you are',
+      '         about to delete, or that it is yours.',
+    ];
+  }
+  const text = typeof post.text === 'string' ? post.text : '(no text — media-only post?)';
+  const shown = text.length > PREVIEW_CHARS ? `${text.slice(0, PREVIEW_CHARS)}…` : text;
+  return [`content  "${shown.replace(/\n/g, ' ')}"`];
+}
+
+/** Look the post up so the prompt can show it. A failed read is not fatal. */
+async function lookup(urn: string, quiet: boolean): Promise<Shaped | undefined> {
+  const session = loadSession();
+  if (session.state !== 'ok') return undefined;
+  const engine = createEngine(session.session, undefined, quiet);
+
+  const me = await engine.whoami();
+  if (!me.ok) return undefined;
+  const profileUrn = typeof me.value?.entityUrn === 'string' ? me.value.entityUrn : undefined;
+  if (profileUrn === undefined) return undefined;
+
+  const posts = await engine.myPosts(profileUrn, LOOKUP_LIMIT);
+  if (!posts.ok) return undefined;
+  return findOwnPost(shapeAll(posts.value.parsed.items, posts.value.index), urn);
+}
+
+/**
+ * The urn to drop from the local cache after a delete, or null.
+ *
+ * `sync my-posts` upserts and never evicts, so without this a deleted post
+ * lingers and `my-posts` keeps listing something that no longer exists —
+ * observed live, LinkedIn returning 1 post while the cache held 2.
+ *
+ * Only a SUCCESSFUL delete evicts. A failed one means the post is still there,
+ * and dropping it from the cache would hide a post that still exists under the
+ * owner's name — the opposite of the problem being fixed.
+ */
+export function evictionTarget(result: { ok: boolean; id?: string | null }): string | null {
+  if (!result.ok) return null;
+  return typeof result.id === 'string' && result.id !== '' ? result.id : null;
+}
+
+/** Drop the row locally. A cache failure must not report the delete as failed. */
+function evict(urn: string | null, now: number): boolean {
+  if (urn === null) return false;
+  try {
+    return removeUrns(openDb(now), 'my-posts', [urn]) > 0;
+  } catch (e) {
+    if (e instanceof CacheCorrupt) return false;
+    throw e;
+  }
+}
+
+/**
+ * Deleting a COMMENT is a different surface from deleting a post: SDUI rather
+ * than Voyager, and the payload comes from the action menu the server offers on
+ * that comment. That also means the menu is the permission check — a comment
+ * you cannot delete simply has no delete action, so we never send one blindly.
+ */
+async function deleteComment(
+  ref: CommentRef,
+  urn: string,
+  now: number,
+  deps: ConfirmDeps,
+): Promise<Envelope> {
+  if (!deps.isTty) {
+    return err(
+      'delete',
+      'CONFIRMATION_REQUIRED',
+      'deleting needs a human to confirm it at an interactive terminal',
+      'No terminal is attached, so nothing was sent and no network call was made.',
+    );
+  }
+
+  const session = loadSession();
+  if (session.state !== 'ok') {
+    return err('delete', 'AUTH_FAILED', 'no LinkedIn session', LAUNCH_HINT);
+  }
+
+  const refused = reserve('delete', now);
+  if (refused !== null) return refused;
+
+  const headers = buildHeaders(session.session);
+  let html: string;
+  try {
+    const res = await fetch(
+      `https://www.linkedin.com/feed/update/urn:li:activity:${ref.activityId}/`,
+      {
+        headers: {
+          cookie: headers.cookie ?? '',
+          'user-agent': headers['user-agent'] ?? '',
+          accept: 'text/html',
+        },
+        redirect: 'manual',
+      },
+    );
+    if (res.status !== 200) {
+      return err('delete', 'FETCH_FAILED', `the parent post page returned ${res.status}`);
+    }
+    html = await res.text();
+  } catch (e) {
+    return err('delete', 'FETCH_FAILED', `could not load the parent post: ${(e as Error).message}`);
+  }
+  recordHarvestSpend(now);
+
+  const tokens = extractCommentTokens(html, ref.activityId);
+  if (!tokens.ok) return err('delete', 'SCHEMA_DRIFT', tokens.message, tokens.hint);
+
+  const plan: WritePlan<{ urn: string }> = {
+    action: 'delete your comment',
+    payload: { urn },
+    summary: [`comment  ${urn}`, `on post  urn:li:activity:${ref.activityId}`],
+    // Verified live: deleting a parent took its three nested replies with it.
+    reversibility:
+      'NONE. A deleted comment is gone — AND SO IS EVERY REPLY UNDER IT, including other ' +
+      "people's. Verified live.",
+    transport: 'voyager',
+  };
+
+  const gated = await gateWrite('delete', plan, now, deps, { commitSpend: false });
+  if ('ok' in gated) return gated;
+
+  const result = await runCommentAction(
+    ref,
+    DELETE_OP,
+    tokens.trackingId,
+    createLiveClient(session.session),
+  );
+  return result.ok
+    ? ok('delete', { deleted: urn, kind: 'comment' })
+    : err('delete', result.code, result.message, result.hint);
+}
+
+export async function runDelete(
+  urn: string | undefined,
+  now = Date.now(),
+  deps?: ConfirmDeps,
+  quiet = false,
+): Promise<Envelope> {
+  if (urn === undefined || urn === '') {
+    return err(
+      'delete',
+      'INVALID_INPUT',
+      'a post urn is required',
+      'profile-gateway delete <urn:li:share:… | urn:li:activity:…>',
+    );
+  }
+  // A comment urn routes to an entirely different surface.
+  const asComment = parseCommentUrn(urn);
+  if (asComment !== null) return deleteComment(asComment, urn, now, deps ?? terminalDeps());
+
+  if (!isDeletableUrn(urn)) {
+    return err(
+      'delete',
+      'INVALID_INPUT',
+      `'${urn}' does not identify a post`,
+      'Expected a post urn (urn:li:share|activity|ugcPost:<id>) or a comment urn. Refusing before ' +
+        'encoding it, because a well-formed request naming the wrong kind of entity is a request ' +
+        'to destroy the wrong kind of thing.',
+    );
+  }
+
+  const session = loadSession();
+  if (session.state === 'corrupt') {
+    return err('delete', 'CACHE_CORRUPT', 'the stored session was unreadable', LAUNCH_HINT);
+  }
+  if (session.state === 'missing') {
+    // Deleting goes over Voyager only. LinkedIn's official API has a delete,
+    // but this tool has not built or verified it, and an unverified destructive
+    // call is the last place to start guessing.
+    return err(
+      'delete',
+      'AUTH_FAILED',
+      'no LinkedIn session — deleting goes over the private API',
+      `Run \`profile-gateway login\`. ${LAUNCH_HINT}`,
+    );
+  }
+
+  const refused = reserve('delete', now);
+  if (refused !== null) return refused;
+
+  // Read before destroying. This costs one read and is the entire point.
+  const post = await lookup(urn, quiet);
+
+  const plan: WritePlan<{ urn: string }> = {
+    action: 'delete a post',
+    payload: { urn },
+    summary: [`post     ${urn}`, ...previewLines(post)],
+    reversibility: 'NONE. A deleted post is gone, with its comments and reactions.',
+    transport: 'voyager',
+  };
+
+  // The client accounts for the DELETE itself.
+  const gated = await gateWrite('delete', plan, now, deps ?? terminalDeps(), {
+    commitSpend: false,
+  });
+  if ('ok' in gated) return gated;
+
+  const result = await deletePost(gated.confirmed as never, createLiveClient(session.session));
+  if (!result.ok) return err('delete', result.code, result.message, result.hint);
+
+  // LinkedIn has it gone; drop our copy so `my-posts` stops listing it.
+  const evicted = evict(evictionTarget(result), now);
+  return ok('delete', { deleted: urn, verified: post !== undefined, evictedFromCache: evicted });
+}
