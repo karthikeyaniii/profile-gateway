@@ -1274,17 +1274,7 @@ bun run dev -- profile --url "..." --raw
 
 ---
 
-## 📝 License
-
-MIT - See LICENSE file
-
-## 🤝 Contributing
-
-This project is actively maintained. Issues, feature requests, and contributions welcome.
-
----
-
-## 📚 Additional Resources
+##  Additional Resources
 
 - [LinkedIn terms of service](https://www.linkedin.com/legal/user-agreement)
 - [Bun documentation](https://bun.sh/docs)
